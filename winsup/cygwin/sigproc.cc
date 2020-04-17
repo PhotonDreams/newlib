@@ -57,6 +57,9 @@ _cygtls NO_COPY *_sig_tls;
 Static HANDLE my_sendsig;
 Static HANDLE my_readsig;
 
+/* Used in select if a signalfd is part of the read descriptor set */
+HANDLE NO_COPY my_pendingsigs_evt;
+
 /* Function declarations */
 static int __reg1 checkstate (waitq *);
 static __inline__ bool get_proc_lock (DWORD, DWORD);
@@ -68,7 +71,7 @@ static void WINAPI wait_sig (VOID *arg);
 
 class pending_signals
 {
-  sigpacket sigs[NSIG + 1];
+  sigpacket sigs[_NSIG + 1];
   sigpacket start;
   bool retry;
 
@@ -88,7 +91,7 @@ void __stdcall
 sigalloc ()
 {
   cygheap->sigs = global_sigs =
-    (struct sigaction *) ccalloc_abort (HEAP_SIGS, NSIG, sizeof (struct sigaction));
+    (struct sigaction *) ccalloc_abort (HEAP_SIGS, _NSIG, sizeof (struct sigaction));
   global_sigs[SIGSTOP].sa_flags = SA_RESTART | SA_NODEFER;
 }
 
@@ -97,7 +100,7 @@ signal_fixup_after_exec ()
 {
   global_sigs = cygheap->sigs;
   /* Set up child's signal handlers */
-  for (int i = 0; i < NSIG; i++)
+  for (int i = 0; i < _NSIG; i++)
     {
       global_sigs[i].sa_mask = 0;
       if (global_sigs[i].sa_handler != SIG_IGN)
@@ -216,9 +219,7 @@ proc_subproc (DWORD what, uintptr_t val)
 	  vchild->process_state |= PID_INITIALIZING;
 	  vchild->ppid = what == PROC_DETACHED_CHILD ? 1 : myself->pid;	/* always set last */
 	}
-      if (what == PROC_DETACHED_CHILD)
-	break;
-      /* fall through intentionally */
+      break;
 
     case PROC_REATTACH_CHILD:
       procs[nprocs] = vchild;
@@ -422,7 +423,7 @@ _cygtls::remove_pending_sigs ()
 extern "C" int
 sigpending (sigset_t *mask)
 {
-  sigset_t outset = (sigset_t) sig_send (myself, __SIGPENDING, &_my_tls);
+  sigset_t outset = sig_send (myself, __SIGPENDING, &_my_tls);
   if (outset == SIG_BAD_MASK)
     return -1;
   *mask = outset;
@@ -448,7 +449,7 @@ sigproc_init ()
   char char_sa_buf[1024];
   PSECURITY_ATTRIBUTES sa = sec_user_nih ((PSECURITY_ATTRIBUTES) char_sa_buf, cygheap->user.sid());
   DWORD err = fhandler_pipe::create (sa, &my_readsig, &my_sendsig,
-				     NSIG * sizeof (sigpacket), "sigwait",
+				     _NSIG * sizeof (sigpacket), "sigwait",
 				     PIPE_ADD_PID);
   if (err)
     {
@@ -457,6 +458,10 @@ sigproc_init ()
     }
   ProtectHandle (my_readsig);
   myself->sendsig = my_sendsig;
+  my_pendingsigs_evt = CreateEvent (NULL, TRUE, FALSE, NULL);
+  if (!my_pendingsigs_evt)
+    api_fatal ("couldn't create pending signal event, %E");
+
   /* sync_proc_subproc is used by proc_subproc.  It serializes
      access to the children and proc arrays.  */
   sync_proc_subproc.init ("sync_proc_subproc");
@@ -503,7 +508,7 @@ exit_thread (DWORD res)
   ExitThread (res);
 }
 
-int __reg3
+sigset_t __reg3
 sig_send (_pinfo *p, int sig, _cygtls *tls)
 {
   siginfo_t si = {};
@@ -516,7 +521,7 @@ sig_send (_pinfo *p, int sig, _cygtls *tls)
    If pinfo *p == NULL, send to the current process.
    If sending to this process, wait for notification that a signal has
    completed before returning.  */
-int __reg3
+sigset_t __reg3
 sig_send (_pinfo *p, siginfo_t& si, _cygtls *tls)
 {
   int rc = 1;
@@ -748,7 +753,7 @@ out:
   if (si.si_signo != __SIGPENDING)
     /* nothing */;
   else if (!rc)
-    rc = (int) pending;
+    rc = pending;
   else
     rc = SIG_BAD_MASK;
   sigproc_printf ("returning %p from sending signal %d", rc, si.si_signo);
@@ -873,7 +878,8 @@ void
 child_info_spawn::wait_for_myself ()
 {
   postfork (myself);
-  myself.remember (false);
+  if (myself.remember (false))
+    myself.reattach ();
   WaitForSingleObject (ev, INFINITE);
 }
 
@@ -943,6 +949,9 @@ cygheap_exec_info::record_children ()
     {
       children[nchildren].pid = procs[nchildren]->pid;
       children[nchildren].p = procs[nchildren];
+      /* Set inheritance of required child handles for reattach_children
+	 in the about-to-be-execed process. */
+      children[nchildren].p.set_inheritance (true);
     }
 }
 
@@ -1335,8 +1344,13 @@ wait_sig (VOID *)
 	    *pack.mask = 0;
 	    tl_entry = cygheap->find_tls (pack.sigtls);
 	    while ((q = q->next))
-	      if (pack.sigtls->sigmask & (bit = SIGTOMASK (q->si.si_signo)))
-		*pack.mask |= bit;
+	      {
+		/* Skip thread-specific signals for other threads. */
+		if (q->sigtls && pack.sigtls != q->sigtls)
+		  continue;
+		if (pack.sigtls->sigmask & (bit = SIGTOMASK (q->si.si_signo)))
+		  *pack.mask |= bit;
+	      }
 	    cygheap->unlock_tls (tl_entry);
 	  }
 	  break;
@@ -1394,6 +1408,16 @@ wait_sig (VOID *)
 		      qnext->si.si_signo = 0;
 		    }
 		}
+	      /* At least one signal still queued?  The event is used in select
+		 only, and only to decide if WFMO should wake up in case a
+		 signalfd is waiting via select/poll for being ready to read a
+		 pending signal.  This method wakes up all threads hanging in
+		 select and having a signalfd, as soon as a pending signal is
+		 available, but it's certainly better than constant polling. */
+	      if (sigq.start.next)
+		SetEvent (my_pendingsigs_evt);
+	      else
+		ResetEvent (my_pendingsigs_evt);
 	      if (pack.si.si_signo == SIGCHLD)
 		clearwait = true;
 	    }

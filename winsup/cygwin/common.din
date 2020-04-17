@@ -98,6 +98,7 @@ __res_querydomain SIGFE
 __res_search SIGFE
 __res_send SIGFE
 __res_state SIGFE
+__sched_getaffinity_sys SIGFE
 __signbitd NOSIGFE
 __signbitf NOSIGFE
 __signgam NOSIGFE
@@ -393,6 +394,16 @@ cygwin_stackdump SIGFE
 cygwin_umount SIGFE
 cygwin_winpid_to_pid SIGFE
 daemon SIGFE
+dbm_clearerr SIGFE
+dbm_close SIGFE
+dbm_delete SIGFE
+dbm_dirfno SIGFE
+dbm_error SIGFE
+dbm_fetch SIGFE
+dbm_firstkey SIGFE
+dbm_nextkey SIGFE
+dbm_open SIGFE
+dbm_store SIGFE
 difftime NOSIGFE
 dirfd SIGFE
 dirname NOSIGFE
@@ -1084,6 +1095,7 @@ pthread_create SIGFE
 pthread_detach SIGFE
 pthread_equal SIGFE
 pthread_exit SIGFE
+pthread_getaffinity_np SIGFE
 pthread_getattr_np SIGFE
 pthread_getconcurrency SIGFE
 pthread_getcpuclockid SIGFE
@@ -1128,6 +1140,7 @@ pthread_rwlockattr_getpshared SIGFE
 pthread_rwlockattr_init SIGFE
 pthread_rwlockattr_setpshared SIGFE
 pthread_self SIGFE
+pthread_setaffinity_np SIGFE
 pthread_setcancelstate SIGFE
 pthread_setcanceltype SIGFE
 pthread_setconcurrency SIGFE
@@ -1248,10 +1261,12 @@ scandirat SIGFE
 scanf SIGFE
 sched_get_priority_max SIGFE
 sched_get_priority_min SIGFE
+sched_getaffinity SIGFE
 sched_getcpu SIGFE
 sched_getparam SIGFE
 sched_getscheduler NOSIGFE
 sched_rr_get_interval SIGFE
+sched_setaffinity SIGFE
 sched_setparam SIGFE
 sched_setscheduler SIGFE
 sched_yield SIGFE

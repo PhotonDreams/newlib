@@ -62,11 +62,10 @@ pinfo::thisproc (HANDLE h)
     {
       cygheap->pid = create_cygwin_pid ();
       flags |= PID_NEW;
+      h = INVALID_HANDLE_VALUE;
     }
   /* spawnve'd process got pid in parent, cygheap->pid has been set in
      child_info_spawn::handle_spawn. */
-  else if (h == INVALID_HANDLE_VALUE)
-    h = NULL;
 
   init (cygheap->pid, flags, h);
   procinfo->process_state |= PID_IN_USE;
@@ -121,12 +120,12 @@ pinfo::status_exit (DWORD x)
       {
 	path_conv pc;
 	if (!procinfo)
-	   pc.check ("/dev/null", PC_NOWARN | PC_POSIX);
+	   pc.check ("/dev/null", PC_POSIX);
 	else
 	  {
 	    UNICODE_STRING uc;
 	    RtlInitUnicodeString(&uc, procinfo->progname);
-	    pc.check (&uc, PC_NOWARN | PC_POSIX);
+	    pc.check (&uc, PC_POSIX);
 	  }
 	small_printf ("%s: error while loading shared libraries: %s: cannot "
 		      "open shared object file: No such file or directory\n",
@@ -479,33 +478,28 @@ pinfo::set_acl()
     debug_printf ("NtSetSecurityObject %y", status);
 }
 
+void
+pinfo_minimal::set_inheritance (bool inherit)
+{
+  DWORD i_flag = inherit ? HANDLE_FLAG_INHERIT : 0;
+
+  SetHandleInformation (rd_proc_pipe, HANDLE_FLAG_INHERIT, i_flag);
+  SetHandleInformation (hProcess, HANDLE_FLAG_INHERIT, i_flag);
+  SetHandleInformation (h, HANDLE_FLAG_INHERIT, i_flag);
+}
+
 pinfo::pinfo (HANDLE parent, pinfo_minimal& from, pid_t pid):
   pinfo_minimal (), destroy (false), procinfo (NULL), waiter_ready (false),
   wait_thread (NULL)
 {
-  HANDLE herr;
-  const char *duperr = NULL;
-  if (!DuplicateHandle (parent, herr = from.rd_proc_pipe, GetCurrentProcess (),
-			&rd_proc_pipe, 0, false, DUPLICATE_SAME_ACCESS))
-    duperr = "couldn't duplicate parent rd_proc_pipe handle %p for forked child %d after exec, %E";
-  else if (!DuplicateHandle (parent, herr = from.hProcess, GetCurrentProcess (),
-			     &hProcess, 0, false, DUPLICATE_SAME_ACCESS))
-    duperr = "couldn't duplicate parent process handle %p for forked child %d after exec, %E";
-  else
-    {
-      h = NULL;
-      DuplicateHandle (parent, from.h, GetCurrentProcess (), &h, 0, false,
-		       DUPLICATE_SAME_ACCESS);
-      init (pid, PID_MAP_RW, h);
-      if (*this)
-	return;
-    }
-
-  if (duperr)
-    debug_printf (duperr, herr, pid);
-
-  /* Returning with procinfo == NULL.  Any open handles will be closed by the
-     destructor. */
+  /* cygheap_exec_info::record_children set the inheritance of the required
+     child handles so just copy them over... */
+  rd_proc_pipe = from.rd_proc_pipe;
+  hProcess = from.hProcess;
+  h = from.h;
+  /* ...and reset their inheritance. */
+  set_inheritance (false);
+  init (pid, PID_MAP_RW, h);
 }
 
 const char *
@@ -554,7 +548,11 @@ _pinfo::set_ctty (fhandler_termios *fh, int flags)
       syscall_printf ("attaching %s sid %d, pid %d, pgid %d, tty->pgid %d, tty->sid %d",
 		      __ctty (), sid, pid, pgid, tc.getpgid (), tc.getsid ());
       if (!cygwin_finished_initializing && !myself->cygstarted
-	  && pgid == pid && tc.getpgid () && tc.getsid ())
+	  && pgid == pid && tc.getpgid () && tc.getsid ()
+	  /* Even GDB starts app via CreateProcess which changes cygstarted.
+	     This results in setting the wrong pgid here, so just skip this
+	     under debugger. */
+	  && !being_debugged ())
 	pgid = tc.getpgid ();
 
       /* May actually need to do this:
@@ -567,7 +565,7 @@ _pinfo::set_ctty (fhandler_termios *fh, int flags)
 	tc.setsid (sid);
       sid = tc.getsid ();
       /* See above */
-      if (!tc.getpgid () && pgid == pid)
+      if ((!tc.getpgid () || being_debugged ()) && pgid == pid)
 	tc.setpgid (pgid);
     }
   debug_printf ("cygheap->ctty now %p, archetype %p", cygheap->ctty, fh ? fh->archetype : NULL);
@@ -1418,12 +1416,12 @@ winpids::add (DWORD& nelem, bool winpid, DWORD pid)
     {
       npidlist += slop_pidlist;
       pidlist = (DWORD *) realloc (pidlist, size_pidlist (npidlist + 1));
-      pinfolist = (pinfo *) realloc (pinfolist, size_pinfolist (npidlist + 1));
+      pinfolist = (pinfo *) realloc ((void *) pinfolist, size_pinfolist (npidlist + 1));
     }
 
   _onreturn onreturn;
   pinfo& p = pinfolist[nelem];
-  memset (&p, 0, sizeof (p));
+  memset ((void *) &p, 0, sizeof (p));
 
   bool perform_copy;
   if (cygpid == myself->pid)

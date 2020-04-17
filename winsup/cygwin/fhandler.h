@@ -43,6 +43,12 @@ details. */
 
 #define O_TMPFILE_FILE_ATTRS (FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN)
 
+/* Buffer size for ReadConsoleInput() and PeekConsoleInput(). */
+/* Per MSDN, max size of buffer required is below 64K. */
+/* (65536 / sizeof (INPUT_RECORD)) is 3276, however,
+   ERROR_NOT_ENOUGH_MEMORY occurs in win7 if this value is used. */
+#define INREC_SIZE 2048
+
 extern const char *windows_device_names[];
 extern struct __cygwin_perfile *perfile_table;
 #define __fmode (*(user_data->fmode_ptr))
@@ -126,19 +132,32 @@ enum del_lock_called_from {
 };
 
 enum virtual_ftype_t {
-  virt_fdsymlink = -8,	/* Fd symlink (e.g. /proc/<PID>/fd/0) */
-  virt_blk = -7,	/* Block special */
-  virt_chr = -6,	/* Character special */
-  virt_fsfile = -5,	/* FS-based file via /proc/sys */
-  virt_socket = -4,	/* Socket */
-  virt_pipe = -3,	/* Pipe */
-  virt_symlink = -2,	/* Symlink */
-  virt_file = -1,	/* Regular file */
-  virt_none = 0,	/* Invalid, Error */
-  virt_directory = 1,	/* Directory */
-  virt_rootdir = 2,	/* Root directory of virtual FS */
-  virt_fsdir = 3,	/* FS-based directory via /proc/sys */
+  virt_none	 = 0x0000,	/* Invalid, Error */
+  virt_file	 = 0x0001,	/* Regular file */
+  virt_symlink	 = 0x0002,	/* Symlink */
+  virt_pipe	 = 0x0003,	/* Pipe */
+  virt_socket	 = 0x0004,	/* Socket */
+  virt_chr	 = 0x0005,	/* Character special */
+  virt_blk	 = 0x0006,	/* Block special */
+  virt_fdsymlink = 0x0007,	/* Fd symlink (e.g. /proc/<PID>/fd/0) */
+  virt_fsfile	 = 0x0008,	/* FS-based file via /proc/sys */
+  virt_dir_type	 = 0x1000,
+  virt_directory = 0x1001,	/* Directory */
+  virt_rootdir	 = 0x1002,	/* Root directory of virtual FS */
+  virt_fsdir	 = 0x1003,	/* FS-based directory via /proc/sys */
 };
+
+static inline bool
+virt_ftype_isfile (virtual_ftype_t _f)
+{
+  return _f != virt_none && !(_f & virt_dir_type);
+}
+
+static inline bool
+virt_ftype_isdir (virtual_ftype_t _f)
+{
+  return _f & virt_dir_type;
+}
 
 class fhandler_base
 {
@@ -148,7 +167,7 @@ class fhandler_base
   struct status_flags
   {
     unsigned rbinary		: 1; /* binary read mode */
-    unsigned rbinset	    	: 1; /* binary read mode explicitly set */
+    unsigned rbinset		: 1; /* binary read mode explicitly set */
     unsigned wbinary		: 1; /* binary write mode */
     unsigned wbinset		: 1; /* binary write mode explicitly set */
     unsigned nohandle		: 1; /* No handle associated with fhandler. */
@@ -183,16 +202,21 @@ class fhandler_base
 
   ino_t ino;	/* file ID or hashed filename, depends on FS. */
   LONG _refcnt;
+ public:
+  struct rabuf_t
+  {
+    char *rabuf;		/* used for crlf conversion in text files */
+    size_t ralen;
+    size_t raixget;
+    size_t raixput;
+    size_t rabuflen;
+  };
 
  protected:
   /* File open flags from open () and fcntl () calls */
   int openflags;
 
-  char *rabuf;		/* used for crlf conversion in text files */
-  size_t ralen;
-  size_t raixget;
-  size_t raixput;
-  size_t rabuflen;
+  struct rabuf_t ra;
 
   /* Used for advisory file locking.  See flock.cc.  */
   int64_t unique_id;
@@ -296,7 +320,13 @@ class fhandler_base
     ReleaseSemaphore (read_state, n, NULL);
   }
 
-  bool get_readahead_valid () { return raixget < ralen; }
+  virtual char *&rabuf () { return ra.rabuf; };
+  virtual size_t &ralen () { return ra.ralen; };
+  virtual size_t &raixget () { return ra.raixget; };
+  virtual size_t &raixput () { return ra.raixput; };
+  virtual size_t &rabuflen () { return ra.rabuflen; };
+
+  virtual bool get_readahead_valid () { return raixget () < ralen (); }
   int puts_readahead (const char *s, size_t len = (size_t) -1);
   int put_readahead (char value);
 
@@ -305,7 +335,7 @@ class fhandler_base
 
   void set_readahead_valid (int val, int ch = -1);
 
-  int get_readahead_into_buffer (char *buf, size_t buflen);
+  virtual int get_readahead_into_buffer (char *buf, size_t buflen);
 
   bool has_acls () const { return pc.has_acls (); }
 
@@ -362,6 +392,7 @@ private:
   int __reg2 fstat_by_name (struct stat *buf);
 public:
   virtual int __reg2 fstatvfs (struct statvfs *buf);
+  int __reg2 fstatvfs_by_handle (HANDLE h, struct statvfs *buf);
   int __reg2 utimens_fs (const struct timespec *);
   virtual int __reg1 fchmod (mode_t mode);
   virtual int __reg2 fchown (uid_t uid, gid_t gid);
@@ -414,7 +445,6 @@ public:
   virtual bool is_tty () const { return false; }
   virtual bool ispipe () const { return false; }
   virtual pid_t get_popen_pid () const {return 0;}
-  virtual bool isdevice () const { return true; }
   virtual bool isfifo () const { return false; }
   virtual int ptsname_r (char *, size_t);
   virtual class fhandler_socket *is_socket () { return NULL; }
@@ -446,8 +476,8 @@ public:
   virtual bg_check_types bg_check (int, bool = false) {return bg_ok;}
   virtual void clear_readahead ()
   {
-    raixput = raixget = ralen = rabuflen = 0;
-    rabuf = NULL;
+    raixput () = raixget () = ralen () = rabuflen () = 0;
+    rabuf () = NULL;
   }
   void operator delete (void *p) {cfree (p);}
   virtual void set_eof () {}
@@ -459,7 +489,6 @@ public:
   virtual void seekdir (DIR *, long);
   virtual void rewinddir (DIR *);
   virtual int closedir (DIR *);
-  bool is_auto_device () {return isdevice () && !dev ().isfs ();}
   bool is_fs_special () {return pc.is_fs_special ();}
   bool issymlink () {return pc.issymlink ();}
   bool __reg2 device_access_denied (int);
@@ -576,7 +605,7 @@ class fhandler_socket: public fhandler_base
   int __reg3 facl (int, int, struct acl *);
   int __reg2 link (const char *);
   off_t lseek (off_t, int)
-  { 
+  {
     set_errno (ESPIPE);
     return -1;
   }
@@ -805,6 +834,9 @@ class fhandler_socket_local: public fhandler_socket_wsock
   int getsockopt (int level, int optname, const void *optval,
 		  __socklen_t *optlen);
 
+  int open (int flags, mode_t mode = 0);
+  int close ();
+  int fcntl (int cmd, intptr_t);
   int __reg2 fstat (struct stat *buf);
   int __reg2 fstatvfs (struct statvfs *buf);
   int __reg1 fchmod (mode_t newmode);
@@ -1044,6 +1076,7 @@ class fhandler_socket_unix : public fhandler_socket
   void fixup_after_fork (HANDLE parent);
   void fixup_after_exec ();
   void set_close_on_exec (bool val);
+  void fixup_helper ();
 
  public:
   fhandler_socket_unix ();
@@ -1238,19 +1271,27 @@ public:
 #define MAX_CLIENTS 64
 
 enum fifo_client_connect_state
-  {
-   fc_unknown,
-   fc_connected,
-   fc_invalid
-  };
+{
+  fc_unknown,
+  fc_connected,
+  fc_invalid
+};
+
+enum
+{
+  FILE_PIPE_INPUT_AVAILABLE_STATE = 5
+};
 
 struct fifo_client_handler
 {
   fhandler_base *fh;
   fifo_client_connect_state state;
-  HANDLE connect_evt;
-  fifo_client_handler () : fh (NULL), state (fc_unknown), connect_evt (NULL) {}
+  fifo_client_handler () : fh (NULL), state (fc_unknown) {}
   int close ();
+/* Returns FILE_PIPE_DISCONNECTED_STATE, FILE_PIPE_LISTENING_STATE,
+   FILE_PIPE_CONNECTED_STATE, FILE_PIPE_CLOSING_STATE,
+   FILE_PIPE_INPUT_AVAILABLE_STATE, or -1 on error. */
+  int pipe_state ();
 };
 
 class fhandler_fifo: public fhandler_base
@@ -1271,7 +1312,7 @@ class fhandler_fifo: public fhandler_base
   HANDLE create_pipe_instance (bool);
   NTSTATUS open_pipe (HANDLE&);
   int add_client_handler ();
-  void delete_client_handler (int);
+  int delete_client_handler (int);
   bool listen_client ();
   int stop_listen_client ();
   int check_listen_client_thread ();
@@ -1519,7 +1560,6 @@ class fhandler_disk_file: public fhandler_base
   int dup (fhandler_base *child, int);
   void fixup_after_fork (HANDLE parent);
   int mand_lock (int, struct flock *);
-  bool isdevice () const { return false; }
   int __reg2 fstat (struct stat *buf);
   int __reg1 fchmod (mode_t mode);
   int __reg2 fchown (uid_t uid, gid_t gid);
@@ -1640,25 +1680,18 @@ class fhandler_cygdrive: public fhandler_disk_file
 class fhandler_serial: public fhandler_base
 {
  private:
-  size_t vmin_;				/* from termios */
-  unsigned int vtime_;			/* from termios */
+  cc_t vmin_;				/* from termios */
+  cc_t vtime_;				/* from termios */
   pid_t pgrp_;
   int rts;				/* for Windows 9x purposes only */
   int dtr;				/* for Windows 9x purposes only */
 
  public:
-  int overlapped_armed;
-  OVERLAPPED io_status;
-  DWORD ev;
-
   /* Constructor */
   fhandler_serial ();
 
   int open (int flags, mode_t mode);
-  int close ();
   int init (HANDLE h, DWORD a, mode_t flags);
-  void overlapped_setup ();
-  int dup (fhandler_base *child, int);
   void __reg3 raw_read (void *ptr, size_t& ulen);
   ssize_t __reg3 raw_write (const void *ptr, size_t ulen);
   int tcsendbreak (int);
@@ -1669,14 +1702,12 @@ class fhandler_serial: public fhandler_base
   int tcsetattr (int a, const struct termios *t);
   int tcgetattr (struct termios *t);
   off_t lseek (off_t, int)
-  { 
+  {
     set_errno (ESPIPE);
     return -1;
   }
   int tcflush (int);
   bool is_tty () const { return true; }
-  void fixup_after_fork (HANDLE parent);
-  void fixup_after_exec ();
 
   /* We maintain a pgrp so that tcsetpgrp and tcgetpgrp work, but we
      don't use it for permissions checking.  fhandler_pty_slave does
@@ -1729,7 +1760,7 @@ class fhandler_termios: public fhandler_base
   int ioctl (int, void *);
   tty_min *_tc;
   tty *get_ttyp () {return (tty *) tc ();}
-  int eat_readahead (int n);
+  virtual int eat_readahead (int n);
 
  public:
   tty_min*& tc () {return _tc;}
@@ -1793,7 +1824,7 @@ enum ansi_intensity
 #define gotrparen 9
 #define eatpalette 10
 #define endpalette 11
-#define MAXARGS 10
+#define MAXARGS 16
 
 enum cltype
 {
@@ -1807,6 +1838,7 @@ enum cltype
 class dev_console
 {
   pid_t owner;
+  bool is_legacy;
 
   WORD default_color, underline_color, dim_color;
 
@@ -1821,12 +1853,14 @@ class dev_console
   bool saw_question_mark;
   bool saw_greater_than_sign;
   bool saw_space;
+  bool saw_exclamation_mark;
   bool vt100_graphics_mode_G0;
   bool vt100_graphics_mode_G1;
   bool iso_2022_G1;
   bool alternate_charset_active;
   bool metabit;
   char backspace_keycode;
+  bool screen_alternated; /* For xterm compatible mode only */
 
   char my_title_buf [TITLESIZE + 1];
 
@@ -1871,6 +1905,8 @@ class dev_console
   bool raw_win32_keyboard_mode;
   char cons_rabuf[40];  // cannot get longer than char buf[40] in char_command
   char *cons_rapoi;
+  LONG xterm_mode_input;
+  LONG xterm_mode_output;
 
   inline UINT get_console_cp ();
   DWORD con_to_str (char *d, int dlen, WCHAR w);
@@ -1943,6 +1979,7 @@ private:
   static bool create_invisible_console (HWINSTA);
   static bool create_invisible_console_workaround ();
   static console_state *open_shared_console (HWND, HANDLE&, bool&);
+  void fix_tab_position (void);
 
  public:
   static pid_t tc_getpgid ()
@@ -2001,6 +2038,7 @@ private:
   static bool need_invisible ();
   static void free_console ();
   static const char *get_nonascii_key (INPUT_RECORD& input_rec, char *);
+  static DWORD get_console_process_id (DWORD pid, bool match);
 
   fhandler_console (void *) {}
 
@@ -2025,6 +2063,15 @@ private:
   DWORD __acquire_output_mutex (const char *fn, int ln, DWORD ms);
   void __release_output_mutex (const char *fn, int ln);
 
+  char *&rabuf ();
+  size_t &ralen ();
+  size_t &raixget ();
+  size_t &raixput ();
+  size_t &rabuflen ();
+
+  void request_xterm_mode_input (bool);
+  void request_xterm_mode_output (bool);
+
   friend tty_min * tty_list::get_cttyp ();
 };
 
@@ -2033,8 +2080,8 @@ class fhandler_pty_common: public fhandler_termios
  public:
   fhandler_pty_common ()
     : fhandler_termios (),
-      output_mutex (NULL),
-    input_mutex (NULL), input_available_event (NULL)
+    output_mutex (NULL), input_mutex (NULL),
+    input_available_event (NULL)
   {
     pc.file_attributes (FILE_ATTRIBUTE_NORMAL);
   }
@@ -2071,32 +2118,59 @@ class fhandler_pty_common: public fhandler_termios
     return fh;
   }
 
+  bool attach_pcon_in_fork (void)
+  {
+    return get_ttyp ()->attach_pcon_in_fork;
+  }
+  DWORD get_helper_process_id (void)
+  {
+    return get_ttyp ()->helper_process_id;
+  }
+  HPCON get_pseudo_console (void)
+  {
+    return get_ttyp ()->h_pseudo_console;
+  }
+  bool to_be_read_from_pcon (void);
+
  protected:
-  BOOL process_opost_output (HANDLE h, const void *ptr, ssize_t& len, bool is_echo);
+  BOOL process_opost_output (HANDLE h,
+			     const void *ptr, ssize_t& len, bool is_echo);
 };
 
 class fhandler_pty_slave: public fhandler_pty_common
 {
   HANDLE inuse;			// used to indicate that a tty is in use
-  HANDLE output_handle_cyg;
+  HANDLE output_handle_cyg, io_handle_cyg;
+  DWORD pid_restore;
+  int fd;
 
   /* Helper functions for fchmod and fchown. */
   bool fch_open_handles (bool chown);
   int fch_set_sd (security_descriptor &sd, bool chown);
   void fch_close_handles ();
 
+  bool try_reattach_pcon ();
+  void restore_reattach_pcon ();
+
  public:
   /* Constructor */
   fhandler_pty_slave (int);
+  /* Destructor */
+  ~fhandler_pty_slave ();
 
   void set_output_handle_cyg (HANDLE h) { output_handle_cyg = h; }
   HANDLE& get_output_handle_cyg () { return output_handle_cyg; }
+  void set_handle_cyg (HANDLE h) { io_handle_cyg = h; }
+  HANDLE& get_handle_cyg () { return io_handle_cyg; }
 
   int open (int flags, mode_t mode = 0);
   void open_setup (int flags);
   ssize_t __stdcall write (const void *ptr, size_t len);
   void __reg3 read (void *ptr, size_t& len);
   int init (HANDLE, DWORD, mode_t);
+  int eat_readahead (int n);
+  int get_readahead_into_buffer (char *buf, size_t buflen);
+  bool get_readahead_valid (void);
 
   int tcsetattr (int a, const struct termios *t);
   int tcgetattr (struct termios *t);
@@ -2109,6 +2183,8 @@ class fhandler_pty_slave: public fhandler_pty_common
   void fixup_after_exec ();
 
   select_record *select_read (select_stuff *);
+  select_record *select_write (select_stuff *);
+  select_record *select_except (select_stuff *);
   virtual char const *ttyname () { return pc.dev.name (); }
   int __reg2 fstat (struct stat *buf);
   int __reg3 facl (int, int, struct acl *);
@@ -2131,6 +2207,21 @@ class fhandler_pty_slave: public fhandler_pty_common
     copyto (fh);
     return fh;
   }
+  void set_switch_to_pcon (int fd);
+  void reset_switch_to_pcon (void);
+  void push_to_pcon_screenbuffer (const char *ptr, size_t len, bool is_echo);
+  void mask_switch_to_pcon_in (bool mask);
+  void fixup_after_attach (bool native_maybe, int fd);
+  bool is_line_input (void)
+  {
+    return get_ttyp ()->ti.c_lflag & ICANON;
+  }
+  void setup_locale (void);
+  void set_freeconsole_on_close (bool val);
+  void trigger_redraw_screen (void);
+  void wait_pcon_fwd (void);
+  void pull_pcon_input (void);
+  void update_pcon_input_state (bool need_lock);
 };
 
 #define __ptsname(buf, unit) __small_sprintf ((buf), "/dev/pty%d", (unit))
@@ -2139,15 +2230,14 @@ class fhandler_pty_master: public fhandler_pty_common
   int pktmode;			// non-zero if pty in a packet mode.
   HANDLE master_ctl;		// Control socket for handle duplication
   cygthread *master_thread;	// Master control thread
-  HANDLE from_master, to_master;
+  HANDLE from_master, to_master, from_slave, to_slave;
   HANDLE echo_r, echo_w;
   DWORD dwProcessId;		// Owner of master handles
-  HANDLE io_handle_cyg, to_master_cyg;
+  HANDLE to_master_cyg, from_master_cyg;
   cygthread *master_fwd_thread;	// Master forwarding thread
 
 public:
   HANDLE get_echo_handle () const { return echo_r; }
-  HANDLE& get_handle_cyg () { return io_handle_cyg; }
   /* Constructor */
   fhandler_pty_master (int);
 
@@ -2194,6 +2284,9 @@ public:
     copyto (fh);
     return fh;
   }
+
+  bool setup_pseudoconsole (void);
+  void transfer_input_to_pcon (void);
 };
 
 class fhandler_dev_null: public fhandler_base

@@ -79,7 +79,7 @@ extern "C" void yield ();
 
 #define import_address(x) __import_address ((void *)(x))
 void * __reg1 __import_address (void *);
- 
+
 #define caller_return_address() \
 		__caller_return_address (__builtin_return_address (0))
 void * __reg1 __caller_return_address (void *);
@@ -120,5 +120,6 @@ extern "C" HANDLE WINAPI CygwinCreateThread (LPTHREAD_START_ROUTINE thread_func,
 void SetThreadName (DWORD dwThreadID, const char* threadName);
 
 WORD __get_cpus_per_group (void);
+WORD __get_group_count (void);
 
 #endif /*_MISCFUNCS_H*/

@@ -178,7 +178,8 @@ extern struct per_process_cxx_malloc default_cygwin_cxx_malloc;
 /* various events */
 void events_init ();
 
-void __stdcall close_all_files (bool = false);
+int chmod_device (class path_conv& pc, mode_t mode);
+void close_all_files (bool = false);
 
 /* debug_on_trap support. see exceptions.cc:try_to_debug() */
 extern "C" void error_start_init (const char*);
@@ -199,6 +200,7 @@ ino_t __reg2 hash_path_name (ino_t hash, const char *name);
 void __reg2 nofinalslash (const char *src, char *dst);
 
 void __reg3 *hook_or_detect_cygwin (const char *, const void *, WORD&, HANDLE h = NULL);
+void __reg3 *hook_api (const char *mname, const char *name, const void *fn);
 
 /* Time related */
 void __stdcall totimeval (struct timeval *, PLARGE_INTEGER, int, int);
@@ -214,6 +216,9 @@ void __stdcall set_console_title (char *);
 void init_console_handler (bool);
 
 extern bool wsock_started;
+
+/* PTY related */
+void set_ishybrid_and_switch_to_pcon (HANDLE h);
 
 /* Printf type functions */
 extern "C" void vapi_fatal (const char *, va_list ap) __attribute__ ((noreturn));

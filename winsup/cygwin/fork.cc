@@ -134,6 +134,36 @@ child_info::prefork (bool detached)
 int __stdcall
 frok::child (volatile char * volatile here)
 {
+  cygheap_fdenum cfd (false);
+  while (cfd.next () >= 0)
+    if (cfd->get_major () == DEV_PTYM_MAJOR)
+      {
+	fhandler_base *fh = cfd;
+	fhandler_pty_master *ptym = (fhandler_pty_master *) fh;
+	if (ptym->get_pseudo_console ())
+	  {
+	    debug_printf ("found a PTY master %d: helper_PID=%d",
+			  ptym->get_minor (), ptym->get_helper_process_id ());
+	    if (fhandler_console::get_console_process_id (
+				ptym->get_helper_process_id (), true))
+	      /* Already attached */
+	      break;
+	    else
+	      {
+		if (ptym->attach_pcon_in_fork ())
+		  {
+		    FreeConsole ();
+		    if (!AttachConsole (ptym->get_helper_process_id ()))
+		      /* Error */;
+		    else
+		      break;
+		  }
+	      }
+	  }
+      }
+  extern void clear_pcon_attached_to (void); /* fhandler_tty.cc */
+  clear_pcon_attached_to ();
+
   HANDLE& hParent = ch.parent;
 
   sync_with_parent ("after longjmp", true);
@@ -180,15 +210,11 @@ frok::child (volatile char * volatile here)
 
   cygheap->fdtab.fixup_after_fork (hParent);
 
-  /* If we haven't dynamically loaded any dlls, just signal the parent.
-     Otherwise, tell the parent that we've loaded all the dlls
-     and wait for the parent to fill in the loaded dlls' data/bss. */
-  if (!load_dlls)
-    sync_with_parent ("performed fork fixup", false);
-  else
-    sync_with_parent ("loaded dlls", true);
+  /* Signal that we have successfully initialized, so the parent can
+     - transfer data/bss for dynamically loaded dlls (if any), or
+     - terminate the current fork call even if the child is initialized. */
+  sync_with_parent ("performed fork fixups and dynamic dll loading", true);
 
-  init_console_handler (myself->ctty > 0);
   ForceCloseHandle1 (fork_info->forker_finished, forker_finished);
 
   pthread::atforkchild ();
@@ -477,7 +503,8 @@ frok::parent (volatile char * volatile stack_here)
 	}
     }
 
-  /* Start thread, and then wait for it to reload dlls.  */
+  /* Start the child up, and then wait for it to
+     perform fork fixups and dynamic dll loading (if any). */
   resume_child (forker_finished);
   if (!ch.sync (child->pid, hchild, FORK_WAIT_TIMEOUT))
     {
@@ -508,9 +535,21 @@ frok::parent (volatile char * volatile stack_here)
 	      goto cleanup;
 	    }
 	}
-      /* Start the child up again. */
-      resume_child (forker_finished);
     }
+
+  /* Do not attach to the child before it has successfully initialized.
+     Otherwise we may wait forever, or deliver an orphan SIGCHILD. */
+  if (!child.reattach ())
+    {
+      this_errno = EAGAIN;
+#ifdef DEBUGGING0
+      error ("child reattach failed");
+#endif
+      goto cleanup;
+    }
+
+  /* Finally start the child up. */
+  resume_child (forker_finished);
 
   ForceCloseHandle (forker_finished);
   forker_finished = NULL;

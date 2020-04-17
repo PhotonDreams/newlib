@@ -259,6 +259,23 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 {
   bool rc;
   int res = -1;
+  DWORD pid_restore = 0;
+  bool attach_to_console = false;
+  pid_t ctty_pgid = 0;
+
+  /* Search for CTTY and retrieve its PGID */
+  cygheap_fdenum cfd (false);
+  while (cfd.next () >= 0)
+    if (cfd->get_major () == DEV_PTYS_MAJOR ||
+	cfd->get_major () == DEV_CONS_MAJOR)
+      {
+	fhandler_termios *fh = (fhandler_termios *) (fhandler_base *) cfd;
+	if (fh->tc ()->ntty == myself->ctty)
+	  {
+	    ctty_pgid = fh->tc ()->getpgid ();
+	    break;
+	  }
+      }
 
   /* Check if we have been called from exec{lv}p or spawn{lv}p and mask
      mode to keep only the spawn mode. */
@@ -390,14 +407,6 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
       PROCESS_INFORMATION pi;
       pi.hProcess = pi.hThread = NULL;
       pi.dwProcessId = pi.dwThreadId = 0;
-
-      /* Set up needed handles for stdio */
-      si.dwFlags = STARTF_USESTDHANDLES;
-      si.hStdInput = handle ((in__stdin < 0 ? 0 : in__stdin), false);
-      si.hStdOutput = handle ((in__stdout < 0 ? 1 : in__stdout), true);
-      si.hStdError = handle (2, true);
-
-      si.cb = sizeof (si);
 
       c_flags = GetPriorityClass (GetCurrentProcess ());
       sigproc_printf ("priority class %d", c_flags);
@@ -537,8 +546,7 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	 in a console will break native processes running in the background,
 	 because the Ctrl-C event is sent to all processes in the console, unless
 	 they ignore it explicitely.  CREATE_NEW_PROCESS_GROUP does that for us. */
-      if (!iscygwin () && fhandler_console::exists ()
-	  && fhandler_console::tc_getpgid () != myself->pgid)
+      if (!iscygwin () && ctty_pgid && ctty_pgid != myself->pgid)
 	c_flags |= CREATE_NEW_PROCESS_GROUP;
       refresh_cygheap ();
 
@@ -571,6 +579,58 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 			 well_known_authenticated_users_sid,
 			 PROCESS_QUERY_LIMITED_INFORMATION))
 	sa = &sec_none_nih;
+
+      /* Attach to pseudo console if pty salve is used */
+      pid_restore = fhandler_console::get_console_process_id
+	(GetCurrentProcessId (), false);
+      for (int i = 0; i < 3; i ++)
+	{
+	  const int chk_order[] = {1, 0, 2};
+	  int fd = chk_order[i];
+	  fhandler_base *fh = ::cygheap->fdtab[fd];
+	  if (fh && fh->get_major () == DEV_PTYS_MAJOR)
+	    {
+	      fhandler_pty_slave *ptys = (fhandler_pty_slave *) fh;
+	      if (ptys->get_pseudo_console ())
+		{
+		  DWORD helper_process_id = ptys->get_helper_process_id ();
+		  debug_printf ("found a PTY slave %d: helper_PID=%d",
+				    fh->get_minor (), helper_process_id);
+		  if (fhandler_console::get_console_process_id
+					      (helper_process_id, true))
+		    /* Already attached */
+		    attach_to_console = true;
+		  else if (!attach_to_console)
+		    {
+		      FreeConsole ();
+		      if (AttachConsole (helper_process_id))
+			attach_to_console = true;
+		    }
+		  ptys->fixup_after_attach (!iscygwin (), fd);
+		  if (mode == _P_OVERLAY)
+		    ptys->set_freeconsole_on_close (iscygwin ());
+		}
+	    }
+	  else if (fh && fh->get_major () == DEV_CONS_MAJOR)
+	    {
+	      attach_to_console = true;
+	      fhandler_console *cons = (fhandler_console *) fh;
+	      if (wincap.has_con_24bit_colors () && !iscygwin ())
+		if (fd == 1 || fd == 2)
+		  cons->request_xterm_mode_output (false);
+	    }
+	}
+
+      /* Set up needed handles for stdio */
+      si.dwFlags = STARTF_USESTDHANDLES;
+      si.hStdInput = handle ((in__stdin < 0 ? 0 : in__stdin), false);
+      si.hStdOutput = handle ((in__stdout < 0 ? 1 : in__stdout), true);
+      si.hStdError = handle (2, true);
+
+      si.cb = sizeof (si);
+
+      if (!iscygwin ())
+	init_console_handler (myself->ctty > 0);
 
     loop:
       /* When ruid != euid we create the new process under the current original
@@ -779,7 +839,9 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	  child->start_time = time (NULL); /* Register child's starting time. */
 	  child->nice = myself->nice;
 	  postfork (child);
-	  if (!child.remember (mode == _P_DETACH))
+	  if (mode == _P_DETACH
+	      ? !child.remember (true)
+	      : !(child.remember (false) && child.reattach ()))
 	    {
 	      /* FIXME: Child in strange state now */
 	      CloseHandle (pi.hProcess);
@@ -867,6 +929,22 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
   this->cleanup ();
   if (envblock)
     free (envblock);
+
+  if (attach_to_console && pid_restore)
+    {
+      FreeConsole ();
+      AttachConsole (pid_restore);
+      cygheap_fdenum cfd (false);
+      int fd;
+      while ((fd = cfd.next ()) >= 0)
+	if (cfd->get_major () == DEV_PTYS_MAJOR)
+	  {
+	    fhandler_pty_slave *ptys =
+	      (fhandler_pty_slave *) (fhandler_base *) cfd;
+	    ptys->fixup_after_attach (false, fd);
+	  }
+    }
+
   return (int) res;
 }
 
@@ -1020,8 +1098,9 @@ extern "C" int
 spawnvp (int mode, const char *file, const char * const *argv)
 {
   path_conv buf;
-  return spawnve (mode | _P_PATH_TYPE_EXEC, find_exec (file, buf), argv,
-		  cur_environ ());
+  return spawnve (mode | _P_PATH_TYPE_EXEC,
+		  find_exec (file, buf, "PATH", FE_NNF) ?: "",
+		  argv, cur_environ ());
 }
 
 extern "C" int
@@ -1029,7 +1108,9 @@ spawnvpe (int mode, const char *file, const char * const *argv,
 	  const char * const *envp)
 {
   path_conv buf;
-  return spawnve (mode | _P_PATH_TYPE_EXEC, find_exec (file, buf), argv, envp);
+  return spawnve (mode | _P_PATH_TYPE_EXEC,
+		  find_exec (file, buf, "PATH", FE_NNF) ?: "",
+		  argv, envp);
 }
 
 int
@@ -1170,6 +1251,12 @@ av::setup (const char *prog_arg, path_conv& real_path, const char *ext,
 	  }
 	UnmapViewOfFile (buf);
   just_shell:
+	/* Check if script is executable.  Otherwise we start non-executable
+	   scripts successfully, which is incorrect behaviour. */
+	if (real_path.has_acls ()
+	    && check_file_access (real_path, X_OK, true) < 0)
+	  return -1;	/* errno is already set. */
+
 	if (!pgm)
 	  {
 	    if (!p_type_exec)
@@ -1185,12 +1272,6 @@ av::setup (const char *prog_arg, path_conv& real_path, const char *ext,
 	    pgm = (char *) "/bin/sh";
 	    arg1 = NULL;
 	  }
-
-	/* Check if script is executable.  Otherwise we start non-executable
-	   scripts successfully, which is incorrect behaviour. */
-	if (real_path.has_acls ()
-	    && check_file_access (real_path, X_OK, true) < 0)
-	  return -1;	/* errno is already set. */
 
 	/* Replace argv[0] with the full path to the script if this is the
 	   first time through the loop. */

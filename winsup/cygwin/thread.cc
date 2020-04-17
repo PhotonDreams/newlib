@@ -23,6 +23,7 @@ details. */
 #include "winsup.h"
 #include "miscfuncs.h"
 #include "path.h"
+#include <sched.h>
 #include <stdlib.h>
 #include "sigproc.h"
 #include "fhandler.h"
@@ -2607,6 +2608,24 @@ pthread_timedjoin_np (pthread_t thread, void **return_val,
 }
 
 extern "C" int
+pthread_getaffinity_np (pthread_t thread, size_t sizeof_set, cpu_set_t *set)
+{
+  if (!pthread::is_good_object (&thread))
+    return ESRCH;
+
+  return sched_get_thread_affinity (thread->win32_obj_id, sizeof_set, set);
+}
+
+extern "C" int
+pthread_setaffinity_np (pthread_t thread, size_t sizeof_set, const cpu_set_t *set)
+{
+  if (!pthread::is_good_object (&thread))
+    return ESRCH;
+
+  return sched_set_thread_affinity (thread->win32_obj_id, sizeof_set, set);
+}
+
+extern "C" int
 pthread_getattr_np (pthread_t thread, pthread_attr_t *attr)
 {
   THREAD_BASIC_INFORMATION tbi;
@@ -3292,7 +3311,7 @@ pthread_kill (pthread_t thread, int sig)
     rval = ESRCH;
   else if (sig)
     {
-      rval = sig_send (NULL, si, thread->cygtls);
+      rval = (int) sig_send (NULL, si, thread->cygtls);
       if (rval == -1)
 	rval = get_errno ();
     }
@@ -3335,7 +3354,7 @@ pthread_sigqueue (pthread_t *thread, int sig, const union sigval value)
   si.si_value = value;
   si.si_pid = myself->pid;
   si.si_uid = myself->uid;
-  return sig_send (NULL, si, (*thread)->cygtls);
+  return (int) sig_send (NULL, si, (*thread)->cygtls);
 }
 
 /* ID */

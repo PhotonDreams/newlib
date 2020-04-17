@@ -44,20 +44,21 @@ extern suffix_info stat_suffixes[];
    below path_types.  Ever. */
 enum pathconv_arg
 {
-  PC_SYM_FOLLOW		 = _BIT ( 0),
-  PC_SYM_NOFOLLOW	 = _BIT ( 1),
-  PC_SYM_NOFOLLOW_REP	 = _BIT ( 2),
-  PC_SYM_CONTENTS	 = _BIT ( 3),
-  PC_NOFULL		 = _BIT ( 4),
-  PC_NULLEMPTY		 = _BIT ( 5),
-  PC_NONULLEMPTY	 = _BIT ( 6),
-  PC_POSIX		 = _BIT ( 7),
-  PC_NOWARN		 = _BIT ( 8),
+  PC_SYM_FOLLOW		 = _BIT ( 0),	/* follow symlinks */
+  PC_SYM_NOFOLLOW	 = _BIT ( 1),	/* don't follow symlinks (but honor
+					   trailing slashes) */
+  PC_SYM_NOFOLLOW_REP	 = _BIT ( 2),	/* don't follow dir reparse point */
+  PC_SYM_CONTENTS	 = _BIT ( 3),	/* don't follow, return content only */
+  PC_NOFULL		 = _BIT ( 4),	/* keep relative path */
+  PC_NULLEMPTY		 = _BIT ( 5),	/* empty path is no error */
+  PC_NONULLEMPTY	 = _BIT ( 6),	/* override PC_NULLEMPTY default */
+  PC_POSIX		 = _BIT ( 7),	/* return normalized posix path */
   PC_OPEN		 = _BIT ( 9),	/* use open semantics */
   PC_CTTY		 = _BIT (10),	/* could later be used as ctty */
-  PC_SYM_NOFOLLOW_PROCFD = _BIT (11),
-  PC_KEEP_HANDLE	 = _BIT (12),
-  PC_NO_ACCESS_CHECK	 = _BIT (13),
+  PC_SYM_NOFOLLOW_PROCFD = _BIT (11),	/* allow /proc/PID/fd redirection */
+  PC_KEEP_HANDLE	 = _BIT (12),	/* keep handle for later stat calls */
+  PC_NO_ACCESS_CHECK	 = _BIT (13),	/* helper flag for error check */
+  PC_SYM_NOFOLLOW_DIR	 = _BIT (14),	/* don't follow a trailing slash */
   PC_DONT_USE		 = _BIT (31)	/* conversion to signed happens. */
 };
 
@@ -183,10 +184,11 @@ class path_conv
   int isfifo () const {return dev.is_device (FH_FIFO);}
   int isspecial () const {return dev.not_device (FH_FS);}
   int iscygdrive () const {return dev.is_device (FH_CYGDRIVE);}
-  int is_auto_device () const {return isdevice () && !is_fs_special ();}
-  int is_fs_device () const {return isdevice () && is_fs_special ();}
   int is_fs_special () const {return dev.is_fs_special ();}
-  int is_lnk_special () const {return is_fs_device () || isfifo () || is_lnk_symlink ();}
+
+  int is_lnk_special () const {return (isdevice () && is_fs_special ()
+				       && !issocket ())
+      || isfifo () || is_lnk_symlink ();}
 #ifdef __WITH_AF_UNIX
   int issocket () const {return dev.is_device (FH_LOCAL)
 				|| dev.is_device (FH_UNIX);}
@@ -313,7 +315,7 @@ class path_conv
   path_conv& eq_worker (const path_conv& pc, const char *in_path)
   {
     free_strings ();
-    memcpy (this, &pc, sizeof pc);
+    memcpy ((void *) this, &pc, sizeof pc);
     /* The device info might contain pointers to allocated strings, in
        contrast to statically allocated strings.  Calling device::dup()
        will duplicate the string if the source was allocated. */
@@ -444,4 +446,4 @@ int normalize_win32_path (const char *, char *, char *&);
 int normalize_posix_path (const char *, char *, char *&);
 PUNICODE_STRING __reg3 get_nt_native_path (const char *, UNICODE_STRING&, bool);
 
-int __reg3 symlink_worker (const char *, const char *, bool);
+int __reg3 symlink_worker (const char *, path_conv &, bool);

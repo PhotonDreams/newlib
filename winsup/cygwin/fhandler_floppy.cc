@@ -74,7 +74,7 @@ fhandler_dev_floppy::get_drive_info (struct hd_geometry *geo)
       di = (DISK_GEOMETRY *) dbuf;
     }
   if (dix) /* Don't try IOCTL_DISK_GET_PARTITION_INFO_EX if
-	      IOCTL_DISK_GET_DRIVE_GEOMETRY_EX didn't work. 
+	      IOCTL_DISK_GET_DRIVE_GEOMETRY_EX didn't work.
 	      Probably a floppy.*/
     {
       if (!DeviceIoControl (get_handle (),
@@ -546,11 +546,11 @@ fhandler_dev_floppy::raw_write (const void *ptr, size_t len)
       DWORD cplen, written;
 
       /* First check if we have an active read buffer.  If so, try to fit in
-      	 the start of the input buffer and write out the entire result.
+	 the start of the input buffer and write out the entire result.
 	 This also covers the situation after lseek since lseek fills the read
 	 buffer in case we seek to an address which is not sector aligned. */
       if (devbufend && devbufstart < devbufend)
-      	{
+	{
 	  off_t current_pos = get_current_position ();
 	  cplen = MIN (len, devbufend - devbufstart);
 	  memcpy (devbuf + devbufstart, p, cplen);
@@ -621,7 +621,7 @@ fhandler_dev_floppy::raw_write (const void *ptr, size_t len)
 	}
       return bytes_written;
     }
-  
+
   /* In O_DIRECT case, just write. */
   if (write_file (p, len, &bytes_written, &ret))
     return bytes_written;
@@ -657,7 +657,7 @@ fhandler_dev_floppy::lseek (off_t offset, int whence)
       off_t exact_pos = current_pos - (devbufend - devbufstart);
       /* Shortcut when used to get current position. */
       if (offset == 0)
-      	return exact_pos;
+	return exact_pos;
       offset += exact_pos;
       whence = SEEK_SET;
     }

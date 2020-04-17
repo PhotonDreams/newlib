@@ -145,8 +145,6 @@ create_thread_and_wait (int what, PVOID in, PVOID out, DWORD outsize,
   return ndi.ret;
 }
 
-/* Returns 0 if path doesn't exist, >0 if path is a directory,
-   -1 if path is a file, -2 if it's a symlink.  */
 virtual_ftype_t
 fhandler_netdrive::exists ()
 {
@@ -248,7 +246,7 @@ fhandler_netdrive::readdir (DIR *dir, dirent *de)
       if (strlen (get_name ()) == 2)
 	{
 	  UNICODE_STRING ss, ds;
-	  
+
 	  tp.u_get (&ds);
 	  RtlInitUnicodeString (&ss, bs);
 	  RtlDowncaseUnicodeString (&ds, &ss, FALSE);

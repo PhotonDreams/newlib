@@ -22,6 +22,35 @@
 #include "ntdll.h"
 #include "cygwait.h"
 
+/*
+   Overview:
+
+     Currently a FIFO can be opened once for reading and multiple
+     times for writing.  Any attempt to open the FIFO a second time
+     for reading fails with EACCES (from STATUS_ACCESS_DENIED).
+
+     When a FIFO is opened for reading,
+     fhandler_fifo::create_pipe_instance is called to create the first
+     instance of a Windows named pipe server (Windows terminology).  A
+     "listen_client" thread is also started; it waits for pipe clients
+     (Windows terminology again) to connect.  This happens every time
+     a process opens the FIFO for writing.
+
+     The listen_client thread creates new instances of the pipe server
+     as needed, so that there is always an instance available for a
+     writer to connect to.
+
+     The reader maintains a list of "fifo_client_handlers", one for
+     each pipe instance.  A fifo_client_handler manages the connection
+     between the pipe instance and a writer connected to that pipe
+     instance.
+
+     TODO: Allow a FIFO to be opened multiple times for reading.
+     Maybe this could be done by using shared memory, so that all
+     readers could have access to the same list of writers.
+*/
+
+
 /* This is only to be used for writers.  When reading,
 STATUS_PIPE_EMPTY simply means there's no data to be read. */
 #define STATUS_PIPE_IS_CLOSED(status)	\
@@ -184,7 +213,8 @@ fhandler_fifo::create_pipe_instance (bool first)
   timeout.QuadPart = -500000;
   status = NtCreateNamedPipeFile (&ph, access, &attr, &io, sharing,
 				  first ? FILE_CREATE : FILE_OPEN, 0,
-				  FILE_PIPE_MESSAGE_TYPE,
+				  FILE_PIPE_MESSAGE_TYPE
+				    | FILE_PIPE_REJECT_REMOTE_CLIENTS,
 				  FILE_PIPE_MESSAGE_MODE,
 				  nonblocking, max_instances,
 				  DEFAULT_PIPEBUFSIZE, DEFAULT_PIPEBUFSIZE,
@@ -231,8 +261,6 @@ fhandler_fifo::add_client_handler ()
       set_errno (EMFILE);
       goto out;
     }
-  if (!(fc.connect_evt = create_event ()))
-    goto out;
   if (!(fh = build_fh_dev (dev ())))
     {
       set_errno (EMFILE);
@@ -251,19 +279,22 @@ fhandler_fifo::add_client_handler ()
       fh->set_nonblocking (false);
       ret = 0;
       fc.fh = fh;
+      fifo_client_lock ();
       fc_handler[nhandlers++] = fc;
+      fifo_client_unlock ();
     }
 out:
   return ret;
 }
 
-void
+int
 fhandler_fifo::delete_client_handler (int i)
 {
-  fc_handler[i].close ();
+  int ret = fc_handler[i].close ();
   if (i < --nhandlers)
     memmove (fc_handler + i, fc_handler + i + 1,
 	     (nhandlers - i) * sizeof (fc_handler[i]));
+  return ret;
 }
 
 /* Just hop to the listen_client_thread method. */
@@ -297,21 +328,21 @@ fhandler_fifo::listen_client ()
 void
 fhandler_fifo::record_connection (fifo_client_handler& fc)
 {
-  fifo_client_lock ();
+  SetEvent (write_ready);
   fc.state = fc_connected;
   nconnected++;
   fc.fh->set_nonblocking (true);
   set_pipe_non_blocking (fc.fh->get_handle (), true);
-  fifo_client_unlock ();
-  HANDLE evt = InterlockedExchangePointer (&fc.connect_evt, NULL);
-  if (evt)
-    CloseHandle (evt);
 }
 
 DWORD
 fhandler_fifo::listen_client_thread ()
 {
   DWORD ret = -1;
+  HANDLE evt;
+
+  if (!(evt = create_event ()))
+    goto out;
 
   while (1)
     {
@@ -324,22 +355,25 @@ fhandler_fifo::listen_client_thread ()
       while (i < nhandlers)
 	{
 	  if (fc_handler[i].state == fc_invalid)
-	    delete_client_handler (i);
+	    {
+	      if (delete_client_handler (i) < 0)
+		{
+		  fifo_client_unlock ();
+		  goto out;
+		}
+	    }
 	  else
 	    i++;
 	}
+      fifo_client_unlock ();
 
       /* Create a new client handler. */
       if (add_client_handler () < 0)
-	{
-	  fifo_client_unlock ();
-	  goto out;
-	}
+	goto out;
 
       /* Allow a writer to open. */
       if (!arm (read_ready))
 	{
-	  fifo_client_unlock ();
 	  __seterrno ();
 	  goto out;
 	}
@@ -349,13 +383,11 @@ fhandler_fifo::listen_client_thread ()
       NTSTATUS status;
       IO_STATUS_BLOCK io;
 
-      status = NtFsControlFile (fc.fh->get_handle (), fc.connect_evt,
-				NULL, NULL, &io, FSCTL_PIPE_LISTEN,
-				NULL, 0, NULL, 0);
-      fifo_client_unlock ();
+      status = NtFsControlFile (fc.fh->get_handle (), evt, NULL, NULL, &io,
+				FSCTL_PIPE_LISTEN, NULL, 0, NULL, 0);
       if (status == STATUS_PENDING)
 	{
-	  HANDLE w[2] = { fc.connect_evt, lct_termination_evt };
+	  HANDLE w[2] = { evt, lct_termination_evt };
 	  DWORD waitret = WaitForMultipleObjects (2, w, false, INFINITE);
 	  switch (waitret)
 	    {
@@ -374,37 +406,52 @@ fhandler_fifo::listen_client_thread ()
 	    }
 	}
       HANDLE ph = NULL;
+      int ps = -1;
+      fifo_client_lock ();
       switch (status)
 	{
 	case STATUS_SUCCESS:
 	case STATUS_PIPE_CONNECTED:
 	  record_connection (fc);
+	  ResetEvent (evt);
 	  break;
 	case STATUS_THREAD_IS_TERMINATING:
-	  /* Try to cancel the pending listen.  Otherwise the first
-	     writer to connect after the thread is restarted will be
-	     invisible.
-
-	     FIXME: Is there a direct way to do this?  We do it by
-	     opening and closing a write handle to the client side. */
-	  open_pipe (ph);
-	  /* We don't care about the return value of open_pipe.  Even
-             if the latter failed, a writer might have connected. */
-	  if (WaitForSingleObject (fc.connect_evt, 0) == WAIT_OBJECT_0
+	  /* Force NtFsControlFile to complete.  Otherwise the next
+	     writer to connect might not be recorded in the client
+	     handler list. */
+	  status = open_pipe (ph);
+	  if (NT_SUCCESS (status)
 	      && (NT_SUCCESS (io.Status) || io.Status == STATUS_PIPE_CONNECTED))
-	    record_connection (fc);
+	    {
+	      debug_printf ("successfully connected bogus client");
+	      if (delete_client_handler (nhandlers - 1) < 0)
+		ret = -1;
+	    }
+	  else if ((ps = fc.pipe_state ()) == FILE_PIPE_CONNECTED_STATE
+		   || ps == FILE_PIPE_INPUT_AVAILABLE_STATE)
+	    {
+	      /* A connection was made under our nose. */
+	      debug_printf ("recording connection before terminating");
+	      record_connection (fc);
+	    }
 	  else
-	    fc.state = fc_invalid;
-	  /* By closing ph we ensure that if fc connected to ph, fc
-	     will be declared invalid on the next read attempt. */
+	    {
+	      debug_printf ("failed to terminate NtFsControlFile cleanly");
+	      delete_client_handler (nhandlers - 1);
+	      ret = -1;
+	    }
 	  if (ph)
 	    CloseHandle (ph);
+	  fifo_client_unlock ();
 	  goto out;
 	default:
+	  debug_printf ("NtFsControlFile status %y", status);
 	  __seterrno_from_nt_status (status);
-	  fc.state = fc_invalid;
+	  delete_client_handler (nhandlers - 1);
+	  fifo_client_unlock ();
 	  goto out;
 	}
+      fifo_client_unlock ();
       /* Check for thread termination in case WaitForMultipleObjects
 	 didn't get called above. */
       if (IsEventSignalled (lct_termination_evt))
@@ -414,9 +461,13 @@ fhandler_fifo::listen_client_thread ()
 	}
     }
 out:
-  if (ret < 0)
-    debug_printf ("exiting lct with error, %E");
+  if (evt)
+    CloseHandle (evt);
   ResetEvent (read_ready);
+  if (ret < 0)
+    debug_printf ("exiting with error, %E");
+  else
+    debug_printf ("exiting without error");
   return ret;
 }
 
@@ -429,6 +480,9 @@ fhandler_fifo::open (int flags, mode_t)
    error_errno_set,
    error_set_errno
   } res;
+
+  if (flags & O_PATH)
+    return open_fs (flags);
 
   /* Determine what we're doing with this fhandler: reading, writing, both */
   switch (flags & O_ACCMODE)
@@ -469,7 +523,7 @@ fhandler_fifo::open (int flags, mode_t)
       goto out;
     }
   npbuf[0] = 'w';
-  if (!(write_ready = CreateEvent (sa_buf, false, false, npbuf)))
+  if (!(write_ready = CreateEvent (sa_buf, true, false, npbuf)))
     {
       debug_printf ("CreateEvent for %s failed, %E", npbuf);
       res = error_set_errno;
@@ -640,10 +694,14 @@ ssize_t __reg3
 fhandler_fifo::raw_write (const void *ptr, size_t len)
 {
   ssize_t ret = -1;
-  size_t nbytes = 0, chunk;
+  size_t nbytes = 0;
+  ULONG chunk;
   NTSTATUS status = STATUS_SUCCESS;
   IO_STATUS_BLOCK io;
   HANDLE evt = NULL;
+
+  if (!len)
+    return 0;
 
   if (len <= max_atomic_write)
     chunk = len;
@@ -654,7 +712,10 @@ fhandler_fifo::raw_write (const void *ptr, size_t len)
 
   /* Create a wait event if the FIFO is in blocking mode. */
   if (!is_nonblocking () && !(evt = CreateEvent (NULL, false, false, NULL)))
-    return -1;
+    {
+      __seterrno ();
+      return -1;
+    }
 
   /* Write in chunks, accumulating a total.  If there's an error, just
      return the accumulated total unless the first write fails, in
@@ -663,33 +724,34 @@ fhandler_fifo::raw_write (const void *ptr, size_t len)
     {
       ULONG_PTR nbytes_now = 0;
       size_t left = len - nbytes;
-      size_t len1;
+      ULONG len1;
+      DWORD waitret = WAIT_OBJECT_0;
+
       if (left > chunk)
 	len1 = chunk;
       else
-	len1 = left;
+	len1 = (ULONG) left;
       nbytes_now = 0;
       status = NtWriteFile (get_handle (), evt, NULL, NULL, &io,
 			    (PVOID) ptr, len1, NULL, NULL);
       if (evt && status == STATUS_PENDING)
 	{
-	  DWORD waitret = cygwait (evt, cw_infinite, cw_cancel | cw_sig_eintr);
-	  switch (waitret)
-	    {
-	    case WAIT_OBJECT_0:
-	      status = io.Status;
-	      break;
-	    case WAIT_SIGNALED:
-	      status = STATUS_THREAD_SIGNALED;
-	      break;
-	    case WAIT_CANCELED:
-	      status = STATUS_THREAD_CANCELED;
-	      break;
-	    default:
-	      break;
-	    }
+	  waitret = cygwait (evt);
+	  if (waitret == WAIT_OBJECT_0)
+	    status = io.Status;
 	}
-      if (NT_SUCCESS (status))
+      if (waitret == WAIT_CANCELED)
+	status = STATUS_THREAD_CANCELED;
+      else if (waitret == WAIT_SIGNALED)
+	status = STATUS_THREAD_SIGNALED;
+      else if (isclosed ())  /* A signal handler might have closed the fd. */
+	{
+	  if (waitret == WAIT_OBJECT_0)
+	    set_errno (EBADF);
+	  else
+	    __seterrno ();
+	}
+      else if (NT_SUCCESS (status))
 	{
 	  nbytes_now = io.Information;
 	  /* NtWriteFile returns success with # of bytes written == 0
@@ -714,7 +776,7 @@ fhandler_fifo::raw_write (const void *ptr, size_t len)
     }
   if (evt)
     CloseHandle (evt);
-  if (status == STATUS_THREAD_SIGNALED && !_my_tls.call_signal_handler ())
+  if (status == STATUS_THREAD_SIGNALED && ret < 0)
     set_errno (EINTR);
   else if (status == STATUS_THREAD_CANCELED)
     pthread::static_cancel_self ();
@@ -731,7 +793,7 @@ fhandler_fifo::hit_eof ()
   bool eof;
   bool retry = true;
 
-retry:
+repeat:
       fifo_client_lock ();
       eof = (nconnected == 0);
       fifo_client_unlock ();
@@ -740,7 +802,7 @@ retry:
 	  retry = false;
 	  /* Give the listen_client thread time to catch up. */
 	  Sleep (1);
-	  goto retry;
+	  goto repeat;
 	}
   return eof;
 }
@@ -776,13 +838,14 @@ fhandler_fifo::check_listen_client_thread ()
 void __reg3
 fhandler_fifo::raw_read (void *in_ptr, size_t& len)
 {
-  size_t orig_len = len;
-
   /* Make sure the lct is running. */
   int res = check_listen_client_thread ();
   debug_printf ("lct status %d", res);
   if (res < 0 || (res == 0 && !listen_client ()))
     goto errout;
+
+  if (!len)
+    return;
 
   while (1)
     {
@@ -797,26 +860,40 @@ fhandler_fifo::raw_read (void *in_ptr, size_t& len)
       for (int i = 0; i < nhandlers; i++)
 	if (fc_handler[i].state == fc_connected)
 	  {
-	    len = orig_len;
-	    fc_handler[i].fh->fhandler_base::raw_read (in_ptr, len);
-	    ssize_t nread = (ssize_t) len;
-	    if (nread > 0)
+	    NTSTATUS status;
+	    IO_STATUS_BLOCK io;
+	    size_t nbytes = 0;
+
+	    status = NtReadFile (get_fc_handle (i), NULL, NULL, NULL,
+				 &io, in_ptr, len, NULL, NULL);
+	    switch (status)
 	      {
-		fifo_client_unlock ();
-		return;
-	      }
-	    /* If the pipe is empty, we  get nread == -1 with
-	       ERROR_NO_DATA. */
-	    else if (nread < 0 && GetLastError () != ERROR_NO_DATA)
-	      {
-		fifo_client_unlock ();
-		goto errout;
-	      }
-	    else if (nread == 0)
-	      /* Client has disconnected. */
-	      {
+	      case STATUS_SUCCESS:
+	      case STATUS_BUFFER_OVERFLOW:
+		/* io.Information is supposedly valid. */
+		nbytes = io.Information;
+		if (nbytes > 0)
+		  {
+		    len = nbytes;
+		    fifo_client_unlock ();
+		    return;
+		  }
+		break;
+	      case STATUS_PIPE_EMPTY:
+		break;
+	      case STATUS_PIPE_BROKEN:
+		/* Client has disconnected.  Mark the client handler
+		   to be deleted when it's safe to do that. */
 		fc_handler[i].state = fc_invalid;
 		nconnected--;
+		break;
+	      default:
+		debug_printf ("NtReadFile status %y", status);
+		__seterrno_from_nt_status (status);
+		fc_handler[i].state = fc_invalid;
+		nconnected--;
+		fifo_client_unlock ();
+		goto errout;
 	      }
 	  }
       fifo_client_unlock ();
@@ -827,26 +904,45 @@ fhandler_fifo::raw_read (void *in_ptr, size_t& len)
 	}
       else
 	{
-	  /* Allow interruption.  Copied from
-	     fhandler_socket_unix::open_reparse_point. */
-	  pthread_testcancel ();
-	  if (cygwait (NULL, cw_nowait, cw_sig_eintr) == WAIT_SIGNALED
-	      && !_my_tls.call_signal_handler ())
+	  /* Allow interruption. */
+	  DWORD waitret = cygwait (NULL, cw_nowait, cw_cancel | cw_sig_eintr);
+	  if (waitret == WAIT_CANCELED)
+	    pthread::static_cancel_self ();
+	  else if (waitret == WAIT_SIGNALED)
 	    {
-	      set_errno (EINTR);
-	      goto errout;
+	      if (_my_tls.call_signal_handler ())
+		continue;
+	      else
+		{
+		  set_errno (EINTR);
+		  goto errout;
+		}
 	    }
-	  /* Don't hog the CPU. */
-	  Sleep (1);
 	}
+      /* We might have been closed by a signal handler or another thread. */
+      if (isclosed ())
+	{
+	  set_errno (EBADF);
+	  goto errout;
+	}
+      /* Don't hog the CPU. */
+      Sleep (1);
     }
 errout:
-  len = -1;
+  len = (size_t) -1;
 }
 
 int __reg2
 fhandler_fifo::fstatvfs (struct statvfs *sfs)
 {
+  if (get_flags () & O_PATH)
+    /* We already have a handle. */
+    {
+      HANDLE h = get_handle ();
+      if (h)
+	return fstatvfs_by_handle (h, sfs);
+    }
+
   fhandler_disk_file fh (pc);
   fh.get_device () = FH_FS;
   return fh.fstatvfs (sfs);
@@ -856,16 +952,34 @@ int
 fifo_client_handler::close ()
 {
   int res = 0;
-  HANDLE evt = InterlockedExchangePointer (&connect_evt, NULL);
 
-  if (evt)
-    CloseHandle (evt);
   if (fh)
     {
       res = fh->fhandler_base::close ();
       delete fh;
     }
   return res;
+}
+
+int
+fifo_client_handler::pipe_state ()
+{
+  IO_STATUS_BLOCK io;
+  FILE_PIPE_LOCAL_INFORMATION fpli;
+  NTSTATUS status;
+
+  status = NtQueryInformationFile (fh->get_handle (), &io, &fpli,
+				   sizeof (fpli), FilePipeLocalInformation);
+  if (!NT_SUCCESS (status))
+    {
+      debug_printf ("NtQueryInformationFile status %y", status);
+      __seterrno_from_nt_status (status);
+      return -1;
+    }
+  else if (fpli.ReadDataAvailable > 0)
+    return FILE_PIPE_INPUT_AVAILABLE_STATE;
+  else
+    return fpli.NamedPipeState;
 }
 
 int
@@ -898,14 +1012,19 @@ fhandler_fifo::stop_listen_client ()
 int
 fhandler_fifo::close ()
 {
+  /* Avoid deadlock with lct in case this is called from a signal
+     handler or another thread. */
+  fifo_client_unlock ();
   int ret = stop_listen_client ();
   if (read_ready)
     CloseHandle (read_ready);
   if (write_ready)
     CloseHandle (write_ready);
+  fifo_client_lock ();
   for (int i = 0; i < nhandlers; i++)
     if (fc_handler[i].close () < 0)
       ret = -1;
+  fifo_client_unlock ();
   return fhandler_base::close () || ret;
 }
 
@@ -915,7 +1034,7 @@ fhandler_fifo::close ()
 int
 fhandler_fifo::fcntl (int cmd, intptr_t arg)
 {
-  if (cmd != F_SETFL || nohandle ())
+  if (cmd != F_SETFL || nohandle () || (get_flags () & O_PATH))
     return fhandler_base::fcntl (cmd, arg);
 
   const bool was_nonblocking = is_nonblocking ();
@@ -931,6 +1050,9 @@ fhandler_fifo::dup (fhandler_base *child, int flags)
 {
   int ret = -1;
   fhandler_fifo *fhf = NULL;
+
+  if (get_flags () & O_PATH)
+    return fhandler_base::dup (child, flags);
 
   if (fhandler_base::dup (child, flags))
     goto out;
@@ -953,6 +1075,7 @@ fhandler_fifo::dup (fhandler_base *child, int flags)
       __seterrno ();
       goto out;
     }
+  fifo_client_lock ();
   for (int i = 0; i < nhandlers; i++)
     {
       if (!DuplicateHandle (GetCurrentProcess (), fc_handler[i].fh->get_handle (),
@@ -960,6 +1083,7 @@ fhandler_fifo::dup (fhandler_base *child, int flags)
 			    &fhf->fc_handler[i].fh->get_handle (),
 			    0, true, DUPLICATE_SAME_ACCESS))
 	{
+	  fifo_client_unlock ();
 	  CloseHandle (fhf->read_ready);
 	  CloseHandle (fhf->write_ready);
 	  fhf->close ();
@@ -967,6 +1091,7 @@ fhandler_fifo::dup (fhandler_base *child, int flags)
 	  goto out;
 	}
     }
+  fifo_client_unlock ();
   if (!reader || fhf->listen_client ())
     ret = 0;
   if (reader)
@@ -987,8 +1112,10 @@ fhandler_fifo::fixup_after_fork (HANDLE parent)
   fhandler_base::fixup_after_fork (parent);
   fork_fixup (parent, read_ready, "read_ready");
   fork_fixup (parent, write_ready, "write_ready");
+  fifo_client_lock ();
   for (int i = 0; i < nhandlers; i++)
     fc_handler[i].fh->fhandler_base::fixup_after_fork (parent);
+  fifo_client_unlock ();
   if (reader && !listen_client ())
     debug_printf ("failed to start lct, %E");
 }
@@ -1007,6 +1134,8 @@ fhandler_fifo::set_close_on_exec (bool val)
   fhandler_base::set_close_on_exec (val);
   set_no_inheritance (read_ready, val);
   set_no_inheritance (write_ready, val);
+  fifo_client_lock ();
   for (int i = 0; i < nhandlers; i++)
     fc_handler[i].fh->fhandler_base::set_close_on_exec (val);
+  fifo_client_unlock ();
 }

@@ -147,6 +147,38 @@ dtable::get_debugger_info ()
 void
 dtable::stdio_init ()
 {
+  for (int i = 0; i < 3; i ++)
+    {
+      const int chk_order[] = {1, 0, 2};
+      int fd = chk_order[i];
+      fhandler_base *fh = cygheap->fdtab[fd];
+      if (fh && fh->get_major () == DEV_PTYS_MAJOR)
+	{
+	  fhandler_pty_slave *ptys = (fhandler_pty_slave *) fh;
+	  if (ptys->get_pseudo_console ())
+	    {
+	      bool attached = !!fhandler_console::get_console_process_id
+		(ptys->get_helper_process_id (), true);
+	      if (attached)
+		break;
+	      else
+		{
+		  /* Not attached to pseudo console in fork() or spawn()
+		     by some reason. This happens if the executable is
+		     a windows GUI binary, such as mintty. */
+		  FreeConsole ();
+		  if (AttachConsole (ptys->get_helper_process_id ()))
+		    {
+		      ptys->fixup_after_attach (false, fd);
+		      break;
+		    }
+		}
+	    }
+	}
+      else if (fh && fh->get_major () == DEV_CONS_MAJOR)
+	break;
+    }
+
   if (myself->cygstarted || ISSTATE (myself, PID_CYGPARENT))
     {
       tty_min *t = cygwin_shared->tty.get_cttyp ();
@@ -369,7 +401,7 @@ dtable::init_std_file_from_handle (int fd, HANDLE handle)
       int openflags = O_BINARY;
 
       /* Console windows are no kernel objects up to Windows 7/2008R2, so the
-      	 access mask returned by NtQueryInformationFile is meaningless.  CMD
+	 access mask returned by NtQueryInformationFile is meaningless.  CMD
 	 always hands down stdin handles as R/O handles, but our tty slave
 	 sides are R/W. */
       if (fh->is_tty ())

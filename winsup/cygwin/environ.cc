@@ -111,7 +111,6 @@ static struct parse_thing
       } values[2];
   } known[] NO_COPY =
 {
-  {"dosfilewarning", {&dos_file_warning}, setbool, NULL, {{false}, {true}}},
   {"error_start", {func: error_start_init}, isfunc, NULL, {{0}, {0}}},
   {"export", {&export_settings}, setbool, NULL, {{false}, {true}}},
   {"glob", {func: glob_init}, isfunc, NULL, {{0}, {s: "normal"}}},
@@ -120,6 +119,7 @@ static struct parse_thing
   {"reset_com", {&reset_com}, setbool, NULL, {{false}, {true}}},
   {"wincmdln", {&wincmdln}, setbool, NULL, {{false}, {true}}},
   {"winsymlinks", {func: set_winsymlinks}, isfunc, NULL, {{0}, {0}}},
+  {"disable_pcon", {&disable_pcon}, setbool, NULL, {{false}, {true}}},
   {NULL, {0}, setdword, 0, {{0}, {0}}}
 };
 
@@ -644,7 +644,7 @@ _addenv (const char *name, const char *value, int overwrite)
 	return -1;		/* Oops.  No more memory. */
 
       /* Put name '=' value into current slot. */
-      strncpy (envhere, name, namelen);
+      memcpy (envhere, name, namelen);
       envhere[namelen] = '=';
       strcpy (envhere + namelen + 1, value);
     }
@@ -859,6 +859,7 @@ environ_init (char **envp, int envc)
   __endtry
 }
 
+int sawTERM = 0;
 
 char ** __reg2
 win32env_to_cygenv (PWCHAR rawenv, bool posify)
@@ -868,7 +869,6 @@ win32env_to_cygenv (PWCHAR rawenv, bool posify)
   int envc;
   char *newp;
   int i;
-  int sawTERM = 0;
   const char cygterm[] = "TERM=cygwin";
   const char xterm[] = "TERM=xterm-256color";
   char *tmpbuf = tp.t_get ();
@@ -1295,7 +1295,7 @@ build_env (const char * const *envp, PWCHAR &envblock, int &envc,
 	 during execve. */
       if (!saw_PATH)
 	{
-	  new_tl += cygheap->installation_dir.Length / sizeof (WCHAR) + 5;
+	  new_tl += cygheap->installation_dir.Length / sizeof (WCHAR) + 5 + 1;
 	  if (new_tl > tl)
 	    tl = raise_envblock (new_tl, envblock, s);
 	  s = wcpcpy (wcpcpy (s, L"PATH="),
